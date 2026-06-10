@@ -1,0 +1,13 @@
+{
+  "name": "Thai Translate – Fast",
+  "temperature": 0.1,
+  "topP": 0.95,
+  "topK": 40,
+  "maxTokens": 200,
+  "repeatPenalty": 1.0,
+  "frequencyPenalty": 0,
+  "presencePenalty": 0,
+  "stop": ["\n", "English:", "Thai:"],
+  "seed": -1,
+  "stream": false
+}

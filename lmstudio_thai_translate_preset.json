@@ -1,13 +1,14 @@
 {
-  "name": "Thai Translate – Fast",
-  "temperature": 0.1,
-  "topP": 0.95,
+  "name": "Thai VN Translate – Qwen3-14B",
+  "temperature": 0.2,
+  "topP": 0.9,
+  "minP": 0.05,
   "topK": 40,
-  "maxTokens": 200,
-  "repeatPenalty": 1.0,
+  "maxTokens": 800,
+  "repeatPenalty": 1.05,
   "frequencyPenalty": 0,
   "presencePenalty": 0,
-  "stop": ["\n", "English:", "Thai:"],
+  "stop": [],
   "seed": -1,
   "stream": false
 }

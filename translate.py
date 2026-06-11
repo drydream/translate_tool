@@ -1,34 +1,38 @@
-"""Auto-translate CSV using a local LM Studio API."""
-import concurrent.futures, csv, json, os, queue, re, sys, threading, time
+"""Auto-translate CSV using LM Studio (scene-aware VN localization)."""
+import concurrent.futures, json, os, queue, re, sys, threading, time
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 import requests
 
-APP_VERSION = '1.0.0'
+APP_VERSION = '2.0.1'
 try:
     import app_updater
 except Exception:
     app_updater = None
 
-# Frozen (PyInstaller onefile): config must live next to the real exe,
-# not inside the throwaway _MEIPASS temp dir, or settings vanish every run.
 if getattr(sys, 'frozen', False):
     _HERE = os.path.dirname(sys.executable)
 else:
     _HERE = os.path.dirname(os.path.abspath(__file__))
-_tls  = threading.local()   # per-thread requests.Session
-CONFIG_FILE = os.path.join(_HERE, 'translate_config.json')
+_tls            = threading.local()
+CONFIG_FILE      = os.path.join(_HERE, 'translate_config.json')
+TERMINOLOGY_FILE = os.path.join(_HERE, 'terminology.json')
 
 DEFAULT_WORLD = (
     'When scientists discovered a portal to a parallel universe, everything changed.\n'
     'This other Earth looked identical—except sex was casual and constant.\n'
     'We dubbed it the "Freeuse World".'
 )
-DEFAULT_API_URL    = 'http://127.0.0.1:1234/v1/completions'
-DEFAULT_MODEL      = 'sailor2-8b-chat-uncensored-i1'
-DEFAULT_MAX_TOKENS = 200
-DEFAULT_WORKERS    = 4
+DEFAULT_API_URL       = 'http://127.0.0.1:1234/v1/chat/completions'
+DEFAULT_MODEL         = 'qwen3-14b-instruct'
+DEFAULT_MAX_TOKENS    = 1500
+DEFAULT_WORKERS       = 2
+DEFAULT_BATCH_SIZE    = 10
+DEFAULT_CONTEXT_LINES = 20
+DEFAULT_TEMPERATURE   = 0.2
+DEFAULT_TOP_P         = 0.9
+DEFAULT_MIN_P         = 0.05
 DEFAULT_MASTER_TEMPLATE = (
     '### [GLOBAL SETTING]\n'
     '- **Overview:** [Overview]\n'
@@ -53,6 +57,8 @@ GRAY   = '#666666'
 ORANGE = '#b05000'
 
 
+# ─── Config I/O ───────────────────────────────────────────────────────────────
+
 def _load_cfg():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -70,12 +76,12 @@ def _save_cfg(d):
 
 
 def _safe_save(df, path):
-    """Write CSV atomically — tmp file first, then rename, so a crash can't corrupt the output."""
     tmp = path + '.tmp'
     df.to_csv(tmp, index=False, encoding='utf-8-sig')
     os.replace(tmp, path)
 
 
+# ─── Output cleanup ───────────────────────────────────────────────────────────
 
 def clean_thai_output(text, original_english):
     if not text:
@@ -86,16 +92,16 @@ def clean_thai_output(text, original_english):
     text = re.sub(r'\(ใส่คำว่า[^)]*\)', '', text)
     text = re.sub(r'\(หรือ[^)]*\)', '', text)
     text = re.sub(r'\(หมายถึง[^)]*\)', '', text)
-    text = re.sub(r'[(][\u0e00-\u0e7f\s"\',:!?./\-]*[)]', '', text)
+    text = re.sub(r'[(][฀-๿\s"\',:!?./\-]*[)]', '', text)
     text = re.sub(r'\([^)]*[a-zA-Z\s]{3,}[^)]*\)',
                   lambda m: m.group(0) if m.group(0) in original_english else '', text)
     text = re.sub(r'(.{4,}?)(?:[\s\-\:]+\1){2,}', r'\1', text)
     text = re.sub(r'\bกู\b', 'ฉัน', text)
     text = re.sub(r'\bมึง\b', 'เธอ', text)
     if variables:
-        cleaned = re.sub("[^\u0e00-\u0e7f\\d\\s.,!?\\-_:\'\"%()a-zA-Z]", '', text)
+        cleaned = re.sub("[^฀-๿\\d\\s.,!?\\-_:\'\"%()a-zA-Z]", '', text)
     else:
-        cleaned = re.sub("[^\u0e00-\u0e7f\\d\\s.,!?\\-_:\'\"%()]", '', text)
+        cleaned = re.sub("[^฀-๿\\d\\s.,!?\\-_:\'\"%()]", '', text)
     cleaned = re.sub(r'\.{4,}', '...', cleaned)
     result = cleaned.strip('"\' ')
     tag_m = re.search(r'(\([^฀-๿)]+\)(?:/\([^฀-๿)]+\))*)\s*$', original_english)
@@ -104,58 +110,384 @@ def clean_thai_output(text, original_english):
     return result
 
 
-def _build_prompt(world, clean_en):
-    return (
-        f'Background Lore & World Setting:\n{world}\n\n'
-        'Role: Professional Thai localization expert specializing in adult (18+) visual novels. '
-        'Your task is to translate English game lines into natural, immersive Thai dialogue.\n\n'
-        
-        'Strict Vocabulary Mapping (Mandatory — Never use soft substitutes or euphemisms):\n'
-        '* fuck / sex -> เย็ด\n'
-        '* horny -> เงี่ยน\n'
-        '* penis / cock / dick -> ควย\n'
-        '* cum -> แตก / น้ำแตก\n'
-        '* tits / boobs -> นม\n\n'
-        
-        'Translation Rules:\n'
-        '1. Tone Consistency: Match the exact intensity of the source. If the English is casual/raw, the Thai must be equally raw using the vocabulary above. If it is neutral, keep the Thai neutral.\n'
-        '2. Character Pronouns: Use natural visual novel pronouns (ฉัน, เธอ, นาย, แก, คุณ, หรือชื่อตัวละคร). STRICTLY FORBIDDEN to use "มึง" or "กู". Ensure the dialogue flows like a real Thai erotica visual novel.\n'
-        '3. No Censorship: This is a translation task for a legally compliant adult game. Do not self-censor, soften, or alter the explicit nature of the text.\n'
-        '4. Names & Proper Nouns: Transliterate phonetically into clear Thai script.\n'
-        '5. Output Format: Output ONLY the one line of the Thai translation. Absolutely no explanations, no notes, no markdown formatting, and no quotation marks around the final output.\n\n'
-        
-        'Examples:\n'
-        'Input: Next\nOutput: ถัดไป\n\n'
-        'Input: Anna\nOutput: แอนนา\n\n'
-        'Input: She turned away, cheeks flushed.\nOutput: เธอเบือนหน้าหนี แก้มแดงก่ำ\n\n'
-        'Input: Oh... fuck... your tits are so big.\nOutput: ซี้ด... เชี่ยเอ้ย... นมเธอโคตรใหญ่เลยว่ะ\n\n'
-        'Input: Put your penis inside me.\nOutput: เอาควยของนายยัดเข้ามาในตัวฉันสิ\n\n'
-        'Input: Oh god, I\'m gonna cum!\nOutput: โอ๊ย... ฉันจะแตกแล้ว!\n\n'
-        f'Input: {clean_en}\nOutput:'
-    )
+# ─── Speaker detection ────────────────────────────────────────────────────────
 
+_SPEAKER_RE = re.compile(
+    r'^(?:'
+    r'([A-Za-z][A-Za-z0-9 _\'\-]{0,30})\s*:\s*$'
+    r'|\[([A-Za-z][A-Za-z0-9 _\'\-]{0,30})\]\s*$'
+    r'|<([A-Za-z][A-Za-z0-9 _\'\-]{0,30})>\s*$'
+    r')'
+)
+
+
+def detect_speaker(text: str):
+    m = _SPEAKER_RE.match(text.strip())
+    if m:
+        return next(g for g in m.groups() if g is not None)
+    return None
+
+
+# ─── Character memory ─────────────────────────────────────────────────────────
+
+class CharacterMemory:
+    def __init__(self):
+        self._chars = {}
+        self._lock = threading.Lock()
+
+    def seed_from_world(self, world_text: str):
+        current_name = None
+        skip_starts = ('note', 'rule', 'warning', 'the ', 'a ', 'an ',
+                       'when ', 'this ', 'we ', 'in ', 'after ', 'every ')
+        for line in world_text.splitlines():
+            line = line.strip()
+            m = re.match(r'^([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?)\s*:?\s*$', line)
+            if m and not any(line.lower().startswith(w) for w in skip_starts):
+                current_name = m.group(1)
+                with self._lock:
+                    self._chars.setdefault(current_name, {})
+                continue
+            if current_name and line and line[0] in '-•*':
+                prop = line.lstrip('-•* ').lower()
+                props = {}
+                if any(w in prop for w in ('female', 'woman', 'girl', 'she/her')):
+                    props['gender'] = 'female'
+                elif any(w in prop for w in ('male', 'man', 'boy', 'he/him')):
+                    props['gender'] = 'male'
+                for p in ('shy', 'confident', 'aggressive', 'romantic', 'playful', 'serious', 'cheerful'):
+                    if p in prop:
+                        props['personality'] = p
+                        break
+                m2 = re.search(r'uses?\s+"([^"\']+)"', prop)
+                if not m2:
+                    m2 = re.search(r'uses?\s+([ฉผเธคนา]{1,4})', prop)
+                if m2:
+                    props['self_pronoun'] = m2.group(1)
+                if props:
+                    with self._lock:
+                        self._chars[current_name].update(props)
+            elif line and line[0] not in '-•*#':
+                current_name = None
+
+    def update(self, name: str, **kwargs):
+        with self._lock:
+            self._chars.setdefault(name, {}).update(kwargs)
+
+    def all_names(self):
+        with self._lock:
+            return list(self._chars.keys())
+
+    def count(self):
+        with self._lock:
+            return len(self._chars)
+
+    def to_prompt_block(self) -> str:
+        with self._lock:
+            if not self._chars:
+                return ''
+            lines = ['CHARACTER PROFILES:']
+            for name, props in self._chars.items():
+                parts = [f'• {name}']
+                for key in ('gender', 'role', 'personality'):
+                    if key in props:
+                        parts.append(props[key])
+                if 'self_pronoun' in props:
+                    parts.append(f'self="{props["self_pronoun"]}"')
+                if 'speech_style' in props:
+                    parts.append(props['speech_style'])
+                lines.append(' | '.join(parts))
+            return '\n'.join(lines)
+
+
+# ─── Terminology DB ───────────────────────────────────────────────────────────
+
+class TerminologyDB:
+    def __init__(self, path: str = ''):
+        self._path = path
+        self._terms = {}
+        self._lock = threading.Lock()
+        if path:
+            self._load()
+
+    def _load(self):
+        try:
+            with open(self._path, 'r', encoding='utf-8') as f:
+                self._terms = json.load(f)
+        except Exception:
+            self._terms = {}
+
+    def save(self):
+        if not self._path:
+            return
+        try:
+            tmp = self._path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._terms, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._path)
+        except Exception:
+            pass
+
+    def add(self, en: str, th: str):
+        with self._lock:
+            self._terms[en] = th
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._terms)
+
+    def to_prompt_block(self) -> str:
+        with self._lock:
+            if not self._terms:
+                return ''
+            lines = ['APPROVED TERMINOLOGY (always use these exact translations):']
+            for en, th in list(self._terms.items())[:60]:
+                lines.append(f'  {en} → {th}')
+            return '\n'.join(lines)
+
+
+# ─── Scene / batch grouping ───────────────────────────────────────────────────
+
+_CHAPTER_RE = re.compile(
+    r'^\s*(?:chapter|scene|act|part|section|prologue|epilogue|interlude|day\s+\d|night\s+\d)\b',
+    re.IGNORECASE,
+)
+
+
+def detect_scene_groups(pending_rows: list, batch_size: int) -> list:
+    """Group (index, text) pairs into scenes then split into batches of batch_size."""
+    if not pending_rows:
+        return []
+    scenes, cur, prev_idx = [], [], None
+    for idx, text in pending_rows:
+        new_scene = False
+        if prev_idx is not None and idx - prev_idx > 5:
+            new_scene = True
+        elif _CHAPTER_RE.match(text):
+            new_scene = True
+        if new_scene and cur:
+            scenes.append(cur)
+            cur = []
+        cur.append((idx, text))
+        prev_idx = idx
+    if cur:
+        scenes.append(cur)
+    batches = []
+    for scene in scenes:
+        for i in range(0, len(scene), batch_size):
+            batches.append(scene[i:i + batch_size])
+    return batches
+
+
+# ─── Chat prompt builders ─────────────────────────────────────────────────────
+
+def _strip_think(text: str) -> str:
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+
+def _build_context_block(df, first_idx: int, context_lines: int) -> str:
+    if context_lines <= 0 or first_idx <= 0:
+        return ''
+    before = df[df.index < first_idx].tail(context_lines)
+    parts = [str(row.get('english', '')).strip()
+             for _, row in before.iterrows()
+             if str(row.get('english', '')).strip()]
+    return '\n'.join(parts)
+
+
+def _build_chat_messages(world: str, context_block: str,
+                          char_memory: CharacterMemory, term_db: TerminologyDB,
+                          batch_lines: list) -> list:
+    sys_parts = [
+        'You are a professional Thai visual novel localizer specializing in adult (18+) games. '
+        'Translate each numbered English line into natural, immersive Thai. '
+        'Output ONLY the numbered translations — no explanations, no notes, no markdown.',
+    ]
+    if world:
+        # Drop empty template fields like "- **Genre:** " before injecting
+        world_clean = '\n'.join(
+            l for l in world.splitlines()
+            if not re.match(r'^\s*-?\s*\*\*[^*]+:\*\*\s*$', l)
+        ).strip()
+        if world_clean:
+            sys_parts.append(f'WORLD SETTING:\n{world_clean}')
+    char_block = char_memory.to_prompt_block()
+    if char_block:
+        sys_parts.append(char_block)
+    term_block = term_db.to_prompt_block()
+    if term_block:
+        sys_parts.append(term_block)
+    sys_parts.append(
+        'TRANSLATION RULES:\n'
+        '1. Preserve all variables exactly: %s  %d  %(name)s  {tag}  [tag]\n'
+        '2. Keep Ren\'Py/VN script tokens unchanged: {i}{/i}{b}{/b}{fast}{w}{nw}{p}{vspace=N} etc.\n'
+        '3. Pronouns: ฉัน/ผม (self), เธอ/คุณ/นาย (you) — NEVER use กู/มึง\n'
+        '4. Match emotional intensity exactly — raw English = raw Thai, romantic = romantic\n'
+        '5. Transliterate proper names phonetically into Thai script\n'
+        '6. Adult vocabulary (mandatory, no euphemisms): fuck/sex=เย็ด, penis/cock=ควย, '
+        'pussy/vagina=หี, cum/orgasm=แตก, tits/boobs=นม, horny=เงี่ยน, ass/butt=ตูด\n'
+        '7. Speaker labels like "Anna:" — transliterate the name, keep the colon\n'
+        '8. Output format: "N. <thai>" — one numbered line per input line, nothing else'
+    )
+    system_msg = '\n\n'.join(sys_parts)
+
+    user_parts = []
+    if context_block:
+        user_parts.append(
+            f'RECENT CONTEXT (reference only — do NOT re-translate):\n{context_block}'
+        )
+    numbered = '\n'.join(f'{i + 1}. {text}' for i, (_, text) in enumerate(batch_lines))
+    user_parts.append(f'TRANSLATE THESE {len(batch_lines)} LINE(S):\n{numbered}')
+    user_msg = '\n\n'.join(user_parts)
+
+    return [
+        {'role': 'system', 'content': system_msg},
+        {'role': 'user',   'content': user_msg},
+    ]
+
+
+# ─── Batch response parsing & validation ─────────────────────────────────────
+
+def _parse_batch_response(raw: str, expected: int):
+    raw = _strip_think(raw).strip()
+    matches = re.findall(r'^\s*(\d+)[.):\-]\s*(.+)', raw, re.MULTILINE)
+    if matches:
+        numbered = {int(n): t.strip() for n, t in matches}
+        if all(i + 1 in numbered for i in range(expected)):
+            return [numbered[i + 1] for i in range(expected)]
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    lines = [l for l in lines if not re.match(
+        r'^(?:Note|Translation|English|Thai|หมายเหตุ|Here|Below|Sure|Certainly|Of course|Got it|Understood)[\s:,]+',
+        l, re.IGNORECASE)]
+    if len(lines) == expected:
+        return lines
+    return None
+
+
+def _validate_line(en: str, th: str) -> bool:
+    if not th:
+        return False
+    # English leakage check (allow short lines / proper names)
+    if not re.search(r'[฀-๿]', th):
+        en_words = len(re.findall(r'[a-zA-Z]+', en))
+        if en_words > 2:
+            return False
+    # Variable / tag preservation — skip [..] check for standalone speaker labels
+    # because [Anna] → [แอนนา] is valid but token sets won't match
+    if detect_speaker(en):
+        token_re = r'%\([^)]+\)[a-z]|%[sd]|\{[^}]+\}'
+    else:
+        token_re = r'%\([^)]+\)[a-z]|%[sd]|\{[^}]+\}|\[[^\]]+\]'
+    return set(re.findall(token_re, en)) == set(re.findall(token_re, th))
+
+
+# ─── Core batch translator ────────────────────────────────────────────────────
+
+def _translate_batch(session, api_url: str, model: str, world: str,
+                     df, batch_rows: list,
+                     char_memory: CharacterMemory, term_db: TerminologyDB,
+                     max_tokens: int, temperature: float, top_p: float, min_p: float,
+                     context_lines: int, stop_event, log_fn, batch_id: int) -> list:
+    if not batch_rows:
+        return []
+    # Auto-split: if only 1 row still fails, return original English
+    if len(batch_rows) == 1:
+        context_block = _build_context_block(df, batch_rows[0][0], context_lines)
+        messages = _build_chat_messages(world, context_block, char_memory, term_db, batch_rows)
+        payload = {
+            'model': model, 'messages': messages,
+            'temperature': temperature, 'top_p': top_p, 'min_p': min_p,
+            'max_tokens': max_tokens, 'stream': False,
+            'enable_thinking': False,
+        }
+        try:
+            resp = session.post(api_url, json=payload, timeout=120)
+            if resp.status_code == 200:
+                raw = resp.json()['choices'][0]['message']['content']
+                parsed = _parse_batch_response(raw, 1)
+                if parsed:
+                    return [clean_thai_output(parsed[0], batch_rows[0][1])]
+                log_fn(f'  Batch {batch_id}: single-line parse failed, raw={raw[:80]!r}')
+            else:
+                log_fn(f'  Batch {batch_id}: single-line HTTP {resp.status_code}')
+        except Exception as e:
+            log_fn(f'  Batch {batch_id}: single-line error: {e}')
+        log_fn(f'  Batch {batch_id}: keeping original for: {batch_rows[0][1][:60]!r}')
+        return [batch_rows[0][1]]
+
+    context_block = _build_context_block(df, batch_rows[0][0], context_lines)
+    messages = _build_chat_messages(world, context_block, char_memory, term_db, batch_rows)
+    payload = {
+        'model': model, 'messages': messages,
+        'temperature': temperature, 'top_p': top_p, 'min_p': min_p,
+        'max_tokens': max_tokens, 'stream': False,
+        'enable_thinking': False,
+    }
+    last_result = None
+    for attempt in range(3):
+        if stop_event.is_set():
+            return [row[1] for row in batch_rows]
+        try:
+            resp = session.post(api_url, json=payload, timeout=120)
+            if resp.status_code != 200:
+                log_fn(f'  Batch {batch_id}: HTTP {resp.status_code}, attempt {attempt + 1}')
+                time.sleep(2)
+                continue
+            data = resp.json()['choices'][0]
+            raw = data['message']['content']
+            finish = data.get('finish_reason', '?')
+            parsed = _parse_batch_response(raw, len(batch_rows))
+            if parsed is None:
+                got = len([l for l in raw.strip().splitlines() if l.strip()])
+                log_fn(f'  Batch {batch_id}: parse error – expected {len(batch_rows)},'
+                       f' got ~{got}, finish={finish}')
+                if finish == 'length':
+                    # Output truncated — split batch in half, also halve context to shed overhead
+                    mid = len(batch_rows) // 2
+                    sub_ctx = max(0, context_lines // 2)
+                    log_fn(f'  Batch {batch_id}: splitting {len(batch_rows)} → {mid}+{len(batch_rows)-mid}'
+                           f' (context {context_lines}→{sub_ctx})')
+                    a = _translate_batch(session, api_url, model, world, df,
+                                        batch_rows[:mid], char_memory, term_db,
+                                        max_tokens, temperature, top_p, min_p,
+                                        sub_ctx, stop_event, log_fn, batch_id)
+                    b = _translate_batch(session, api_url, model, world, df,
+                                        batch_rows[mid:], char_memory, term_db,
+                                        max_tokens, temperature, top_p, min_p,
+                                        sub_ctx, stop_event, log_fn, batch_id)
+                    return a + b
+                time.sleep(1)
+                continue
+            final, all_valid = [], True
+            for (_, en), th in zip(batch_rows, parsed):
+                th_clean = clean_thai_output(th, en)
+                if not _validate_line(en, th_clean):
+                    all_valid = False
+                final.append(th_clean)
+            last_result = final
+            if all_valid:
+                return final
+            log_fn(f'  Batch {batch_id}: validation issues, attempt {attempt + 1}')
+            time.sleep(1)
+        except Exception as e:
+            log_fn(f'  Batch {batch_id}: {e}, attempt {attempt + 1}')
+            time.sleep(2)
+    if last_result:
+        return last_result
+    return [row[1] for row in batch_rows]
+
+
+# ─── World-setting template parser (unchanged) ────────────────────────────────
 
 def _parse_with_template(template, pasted):
-    """Smart parser for world_setting.md and similar Markdown blocks.
-
-    1. Splits pasted text into sections by heading and finds the ## Characters
-       table, extracting the top-2 most active characters by dialogue count and
-       mapping them to Character A / B Name placeholders.
-    2. Fuzzy keyword search fills Genre / Tone / Location / Vibe / Target Language.
-       Genre falls back to the game title from the "# World Setting — …" heading.
-    3. Remaining fields get sensible defaults (Role, Personality, Thai pronouns)
-       so the form is never empty — the user only has to fill in the gaps.
-    """
     ph_re = re.compile(r'\[([^\]]+)\]')
     result = {}
 
     def _strip_md(s):
         return re.sub(r'\*+', '', s).strip().lstrip('-').strip()
 
-    # ── Split pasted text into sections by heading ────────────────────────────
-    sections: dict[str, list[str]] = {}
+    sections: dict = {}
     cur_heading = '_root'
-    cur_lines: list[str] = []
+    cur_lines: list = []
     for line in pasted.splitlines():
         if re.match(r'^#{1,4}\s+', line.strip()):
             sections[cur_heading] = cur_lines
@@ -165,7 +497,6 @@ def _parse_with_template(template, pasted):
             cur_lines.append(line)
     sections[cur_heading] = cur_lines
 
-    # ── Helper: first contiguous markdown table in a line list ───────────────
     def _first_table(lines):
         rows = []
         for ln in lines:
@@ -173,25 +504,23 @@ def _parse_with_template(template, pasted):
             if s.startswith('|') and s.endswith('|'):
                 cells = [c.strip() for c in s[1:-1].split('|')]
                 if all(re.fullmatch(r'[-: ]+', c) for c in cells if c):
-                    continue  # separator row
+                    continue
                 rows.append(cells)
             elif rows:
-                break  # stop at first blank / non-table line after table started
+                break
         return (rows[0], rows[1:]) if len(rows) >= 2 else (None, [])
 
-    # ── Extract top-2 character names from the ## Characters table ───────────
     chars_key = next((k for k in sections if 'character' in k), None)
     search_lines = sections[chars_key] if chars_key else pasted.splitlines()
     header, data = _first_table(search_lines)
-    char_names: list[str] = []
+    char_names: list = []
     if header and data:
         h = [c.lower() for c in header]
         name_col = next((i for i, c in enumerate(h)
                          if any(k in c for k in ('name', 'character', 'ชื่อ'))), 0)
-        num_col  = next((i for i, c in enumerate(h)
-                         if any(k in c for k in ('line', 'dialogue', 'count', 'total'))), None)
+        num_col = next((i for i, c in enumerate(h)
+                        if any(k in c for k in ('line', 'dialogue', 'count', 'total'))), None)
         if num_col is None:
-            # auto-detect: find a column whose cells are mostly integers
             for col_i in range(len(h)):
                 if col_i == name_col:
                     continue
@@ -210,36 +539,25 @@ def _parse_with_template(template, pasted):
             if len(r) > name_col
             and r[name_col]
             and re.search(r'[a-zA-Z฀-๿]', r[name_col])
-            and not r[name_col].strip().startswith('*')   # skip *(none detected)*
+            and not r[name_col].strip().startswith('*')
         ][:2]
 
-    # ── Map character names to template placeholders ──────────────────────────
     all_phs = list(dict.fromkeys(ph_re.findall(template)))
-    char_a_ph = next((p for p in all_phs
-                      if 'character a' in p.lower() and 'name' in p.lower()), None)
-    char_b_ph = next((p for p in all_phs
-                      if 'character b' in p.lower() and 'name' in p.lower()), None)
+    char_a_ph = next((p for p in all_phs if 'character a' in p.lower() and 'name' in p.lower()), None)
+    char_b_ph = next((p for p in all_phs if 'character b' in p.lower() and 'name' in p.lower()), None)
     char_a_name = char_names[0] if char_names else ''
     char_b_name = char_names[1] if len(char_names) >= 2 else ''
-    if char_a_ph and char_a_name:
-        result[char_a_ph] = char_a_name
-    if char_b_ph and char_b_name:
-        result[char_b_ph] = char_b_name
+    if char_a_ph and char_a_name: result[char_a_ph] = char_a_name
+    if char_b_ph and char_b_name: result[char_b_ph] = char_b_name
 
-    # ── Extract game title from "# World Setting — GameName" for Genre fallback
     game_title = ''
     for line in pasted.splitlines():
         s = line.strip()
-        if not s.startswith('#'):
-            continue
+        if not s.startswith('#'): continue
         m = re.match(r'^#{1,2}\s+World\s+Setting\s*[—\-–]\s*(.+)', s, re.IGNORECASE)
-        if m:
-            game_title = m.group(1).strip()
-        break  # only inspect the very first heading
+        if m: game_title = m.group(1).strip()
+        break
 
-    # ── Fuzzy keyword matching for known global-setting fields ────────────────
-    # Each tuple: (substring that must appear in the placeholder name,
-    #              ordered regex patterns to try against pasted lines)
     FUZZY_KEYS = [
         ('genre',    [r'genre\s*/\s*theme', r'game\s+genre', r'genre', r'theme']),
         ('tone',     [r'world\s+tone', r'tone']),
@@ -248,62 +566,49 @@ def _parse_with_template(template, pasted):
         ('language', [r'target\s+language', r'language']),
     ]
     pasted_lines = [_strip_md(ln) for ln in pasted.splitlines() if ln.strip()]
-
     for ph in all_phs:
-        if ph in result:
-            continue
+        if ph in result: continue
         ph_lower = ph.lower()
         for key, patterns in FUZZY_KEYS:
-            if key not in ph_lower:
-                continue
+            if key not in ph_lower: continue
             for line in pasted_lines:
                 for pat in patterns:
                     if re.search(pat, line, re.IGNORECASE):
                         colon_pos = line.find(':')
                         if colon_pos != -1:
                             val = _strip_md(line[colon_pos + 1:])
-                            # skip unfilled hints like "(fill in — ...)"
                             if val and not re.match(r'^\(fill', val, re.IGNORECASE):
                                 result[ph] = val
                                 break
-                if ph in result:
-                    break
-            # Genre-only fallback: use game name from the h1 heading
+                if ph in result: break
             if key == 'genre' and ph not in result and game_title:
                 result[ph] = game_title
-            break  # at most one FUZZY_KEY rule per placeholder
+            break
 
-    # ── Intelligent defaults for everything still unmatched ───────────────────
     for ph in all_phs:
-        if ph in result:
-            continue
+        if ph in result: continue
         pl = ph.lower()
-        # Role
         if   'character a' in pl and 'role' in pl:   result[ph] = 'Main Character'
         elif 'character b' in pl and 'role' in pl:   result[ph] = 'Supporting Character'
-        # Personality
         elif 'personality' in pl:                     result[ph] = 'TBD'
-        # Thai self-pronouns
         elif 'character a' in pl and 'self' in pl:   result[ph] = 'ฉัน'
         elif 'character b' in pl and 'self' in pl:   result[ph] = 'เธอ'
-        # Cross-reference pronouns — use the other character's name if known
         elif 'character a' in pl and 'to b' in pl:   result[ph] = char_b_name or 'เธอ'
         elif 'character b' in pl and 'to a' in pl:   result[ph] = char_a_name or 'นาย'
-
     return result
 
+
+# ─── GUI ─────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f'Auto-Translate  (LM Studio)  v{APP_VERSION}')
-        self.minsize(700, 820)
+        self.minsize(700, 900)
         self.resizable(True, True)
-
         self._q    = queue.Queue()
         self._busy = False
         self._stop = threading.Event()
-
         cfg = _load_cfg()
         self._build(cfg)
         self._poll()
@@ -311,27 +616,23 @@ class App(tk.Tk):
             app_updater.cleanup_after_update()
             self._startup_update_check()
 
-    # ── UI construction ───────────────────────────────────────────────────────
-
     def _build(self, cfg):
         self._master_template = cfg.get('master_template', DEFAULT_MASTER_TEMPLATE)
 
         outer = ttk.Frame(self, padding=14)
         outer.pack(fill='both', expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(5, weight=1)  # log row expands
+        outer.rowconfigure(6, weight=1)  # log row
 
         # ── Files ─────────────────────────────────────────────────────────────
         ff = ttk.LabelFrame(outer, text='Files', padding=8)
         ff.grid(row=0, column=0, sticky='ew', pady=(0, 8))
         ff.columnconfigure(1, weight=1)
-
         ttk.Label(ff, text='Source CSV:').grid(row=0, column=0, sticky='w')
         self._src_var = tk.StringVar(value=cfg.get('source', os.path.join(_HERE, 'translation.csv')))
         ttk.Entry(ff, textvariable=self._src_var).grid(row=0, column=1, sticky='ew', padx=6)
         ttk.Button(ff, text='Browse…',
                    command=lambda: self._pick_open(self._src_var)).grid(row=0, column=2)
-
 
         # ── API Settings ──────────────────────────────────────────────────────
         af = ttk.LabelFrame(outer, text='API Settings  (LM Studio)', padding=8)
@@ -357,26 +658,39 @@ class App(tk.Tk):
         ttk.Label(af, text='Max Tokens:').grid(row=2, column=0, sticky='w', pady=(4, 0))
         self._maxtok_var = tk.StringVar(value=str(cfg.get('max_tokens', DEFAULT_MAX_TOKENS)))
         ttk.Entry(af, textvariable=self._maxtok_var, width=8).grid(row=2, column=1, sticky='w', padx=6, pady=(4, 0))
+        ttk.Label(af, text='(~80/line × batch size)', foreground=GRAY).grid(
+            row=2, column=2, columnspan=2, sticky='w', padx=6, pady=(4, 0))
 
         ttk.Label(af, text='Workers:').grid(row=3, column=0, sticky='w', pady=(4, 0))
         self._workers_var = tk.StringVar(value=str(cfg.get('workers', DEFAULT_WORKERS)))
         ttk.Entry(af, textvariable=self._workers_var, width=8).grid(row=3, column=1, sticky='w', padx=6, pady=(4, 0))
-        ttk.Label(af, text='(parallel requests — raise if GPU < 80%)', foreground=GRAY).grid(
+        ttk.Label(af, text='(parallel batch requests — 1-2 recommended for batch mode)', foreground=GRAY).grid(
             row=3, column=2, columnspan=2, sticky='w', padx=6, pady=(4, 0))
+
+        tmp_row = ttk.Frame(af)
+        tmp_row.grid(row=4, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        ttk.Label(tmp_row, text='Temperature:').pack(side='left')
+        self._temperature_var = tk.StringVar(value=str(cfg.get('temperature', DEFAULT_TEMPERATURE)))
+        ttk.Entry(tmp_row, textvariable=self._temperature_var, width=6).pack(side='left', padx=(4, 12))
+        ttk.Label(tmp_row, text='Top P:').pack(side='left')
+        self._top_p_var = tk.StringVar(value=str(cfg.get('top_p', DEFAULT_TOP_P)))
+        ttk.Entry(tmp_row, textvariable=self._top_p_var, width=6).pack(side='left', padx=(4, 12))
+        ttk.Label(tmp_row, text='Min P:').pack(side='left')
+        self._min_p_var = tk.StringVar(value=str(cfg.get('min_p', DEFAULT_MIN_P)))
+        ttk.Entry(tmp_row, textvariable=self._min_p_var, width=6).pack(side='left', padx=(4, 6))
+        ttk.Label(tmp_row, text='(Qwen3-14B defaults)', foreground=GRAY).pack(side='left')
 
         # ── World Setting ─────────────────────────────────────────────────────
         wf = ttk.LabelFrame(outer,
             text='World Setting  (game background lore used as AI translation context)', padding=8)
         wf.grid(row=2, column=0, sticky='ew', pady=(0, 8))
         wf.columnconfigure(0, weight=1)
-
         ttk.Label(wf,
-            text='Edit the story background. The AI reads this before translating every line.',
+            text='Edit the story background. The AI reads this before translating every batch.',
             foreground=GRAY).grid(row=0, column=0, sticky='w', pady=(0, 4))
         self._world_txt = scrolledtext.ScrolledText(wf, height=5, wrap='word')
         self._world_txt.grid(row=1, column=0, sticky='ew')
         self._world_txt.insert('1.0', cfg.get('world_setting', DEFAULT_WORLD))
-
         btn_bar = ttk.Frame(wf)
         btn_bar.grid(row=2, column=0, sticky='w', pady=(6, 0))
         ttk.Button(btn_bar, text='Edit Master Template',
@@ -386,10 +700,49 @@ class App(tk.Tk):
         ttk.Button(btn_bar, text='Import world_setting.md',
                    command=self._import_world_setting).pack(side='left', padx=(8, 0))
 
-        # ── Mode ──────────────────────────────────────────────────────────────
-        mf = ttk.LabelFrame(outer, text='Translation Mode', padding=8)
-        mf.grid(row=3, column=0, sticky='ew', pady=(0, 8))
+        # ── Scene-Aware Settings ──────────────────────────────────────────────
+        sf = ttk.LabelFrame(outer, text='Scene-Aware Settings', padding=8)
+        sf.grid(row=3, column=0, sticky='ew', pady=(0, 8))
 
+        chk_row = ttk.Frame(sf)
+        chk_row.grid(row=0, column=0, sticky='w')
+        self._scene_aware_var = tk.BooleanVar(value=cfg.get('scene_aware', True))
+        self._char_mem_var    = tk.BooleanVar(value=cfg.get('use_char_mem', True))
+        self._term_db_var     = tk.BooleanVar(value=cfg.get('use_term_db', True))
+        self._ctx_mem_var     = tk.BooleanVar(value=cfg.get('use_context', True))
+        ttk.Checkbutton(chk_row, text='Scene-Aware Mode',  variable=self._scene_aware_var).pack(side='left')
+        ttk.Checkbutton(chk_row, text='Character Memory',  variable=self._char_mem_var).pack(side='left', padx=(12, 0))
+        ttk.Checkbutton(chk_row, text='Terminology DB',    variable=self._term_db_var).pack(side='left', padx=(12, 0))
+        ttk.Checkbutton(chk_row, text='Context Memory',    variable=self._ctx_mem_var).pack(side='left', padx=(12, 0))
+
+        param_row = ttk.Frame(sf)
+        param_row.grid(row=1, column=0, sticky='w', pady=(6, 0))
+        ttk.Label(param_row, text='Batch Size:').pack(side='left')
+        self._batch_size_var = tk.StringVar(value=str(cfg.get('batch_size', DEFAULT_BATCH_SIZE)))
+        ttk.Spinbox(param_row, textvariable=self._batch_size_var,
+                    from_=1, to=50, width=5).pack(side='left', padx=(4, 12))
+        ttk.Label(param_row, text='Context Lines:').pack(side='left')
+        self._ctx_lines_var = tk.StringVar(value=str(cfg.get('context_lines', DEFAULT_CONTEXT_LINES)))
+        ttk.Spinbox(param_row, textvariable=self._ctx_lines_var,
+                    from_=0, to=100, width=5).pack(side='left', padx=(4, 12))
+        ttk.Label(param_row,
+                  text='(context length = model load-time setting in LM Studio)',
+                  foreground=GRAY).pack(side='left')
+
+        status_row = ttk.Frame(sf)
+        status_row.grid(row=2, column=0, sticky='w', pady=(6, 0))
+        self._char_status_lbl  = ttk.Label(status_row, text='Characters: –', foreground=GRAY)
+        self._char_status_lbl.pack(side='left')
+        ttk.Label(status_row, text='  |  ', foreground=GRAY).pack(side='left')
+        self._term_count_lbl   = ttk.Label(status_row, text='Terms: 0', foreground=GRAY)
+        self._term_count_lbl.pack(side='left')
+        ttk.Label(status_row, text='  |  ', foreground=GRAY).pack(side='left')
+        self._scene_status_lbl = ttk.Label(status_row, text='Scene: –', foreground=GRAY)
+        self._scene_status_lbl.pack(side='left')
+
+        # ── Translation Mode ──────────────────────────────────────────────────
+        mf = ttk.LabelFrame(outer, text='Translation Mode', padding=8)
+        mf.grid(row=4, column=0, sticky='ew', pady=(0, 8))
         self._mode_var = tk.StringVar(value=cfg.get('mode', 'continue'))
         ttk.Radiobutton(mf,
             text='Continue from previous work  (sync new rows + resume untranslated)',
@@ -400,54 +753,57 @@ class App(tk.Tk):
 
         # ── Run ───────────────────────────────────────────────────────────────
         rf = ttk.LabelFrame(outer, text='Run', padding=8)
-        rf.grid(row=4, column=0, sticky='ew', pady=(0, 8))
+        rf.grid(row=5, column=0, sticky='ew', pady=(0, 8))
         rf.columnconfigure(0, weight=1)
-
         prog_row = ttk.Frame(rf)
         prog_row.grid(row=0, column=0, sticky='ew')
         prog_row.columnconfigure(1, weight=1)
-
         self._prog_lbl = ttk.Label(prog_row, text='Ready.', width=16, anchor='w')
         self._prog_lbl.grid(row=0, column=0, sticky='w')
         self._prog_bar = ttk.Progressbar(prog_row, orient='horizontal', mode='determinate')
         self._prog_bar.grid(row=0, column=1, sticky='ew', padx=(8, 0))
-
         btn_row = ttk.Frame(rf)
         btn_row.grid(row=1, column=0, sticky='w', pady=(8, 0))
-
         self._start_btn = ttk.Button(btn_row, text='Start Translating', command=self._do_start)
         self._start_btn.pack(side='left')
         self._stop_btn = ttk.Button(btn_row, text='Stop', command=self._do_stop, state='disabled')
         self._stop_btn.pack(side='left', padx=(8, 0))
-
         self._status_lbl = ttk.Label(rf, text='')
         self._status_lbl.grid(row=2, column=0, sticky='w', pady=(4, 0))
 
         # ── Log ───────────────────────────────────────────────────────────────
         lf = ttk.LabelFrame(outer, text='Log', padding=6)
-        lf.grid(row=5, column=0, sticky='nsew')
+        lf.grid(row=6, column=0, sticky='nsew')
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
         self._log = scrolledtext.ScrolledText(lf, height=10, wrap='word')
         self._log.grid(row=0, column=0, sticky='nsew')
         self._log.bind('<Key>', lambda e: 'break' if not (e.state & 4) and e.keysym not in (
             'Up', 'Down', 'Left', 'Right', 'Prior', 'Next', 'Home', 'End') else None)
-
         log_menu = tk.Menu(self._log, tearoff=0)
-        log_menu.add_command(label='Copy',
-            command=lambda: self._log.event_generate('<<Copy>>'))
-        log_menu.add_command(label='Select All',
-            command=lambda: self._log.tag_add('sel', '1.0', 'end'))
-        self._log.bind('<Button-3>',
-            lambda e: log_menu.tk_popup(e.x_root, e.y_root))
+        log_menu.add_command(label='Copy',      command=lambda: self._log.event_generate('<<Copy>>'))
+        log_menu.add_command(label='Select All', command=lambda: self._log.tag_add('sel', '1.0', 'end'))
+        self._log.bind('<Button-3>', lambda e: log_menu.tk_popup(e.x_root, e.y_root))
 
         # ── Version / updates bar ─────────────────────────────────────────────
         bar = ttk.Frame(outer)
-        bar.grid(row=6, column=0, sticky='ew', pady=(8, 0))
+        bar.grid(row=7, column=0, sticky='ew', pady=(8, 0))
         self._upd_lbl = ttk.Label(bar, text=f'v{APP_VERSION}', foreground=GRAY)
         self._upd_lbl.pack(side='left')
-        ttk.Button(bar, text='Check for Updates…',
-                   command=self._open_updater).pack(side='right')
+        ttk.Button(bar, text='Check for Updates…', command=self._open_updater).pack(side='right')
+
+    # ── Update / status helpers ───────────────────────────────────────────────
+
+    def _update_memory_status(self, char_memory: CharacterMemory, term_db: TerminologyDB):
+        names = char_memory.all_names()
+        char_text = (', '.join(names[:4]) + ('…' if len(names) > 4 else '')) if names else '–'
+        self._char_status_lbl.configure(text=f'Characters: {char_text}')
+        self._term_count_lbl.configure(text=f'Terms: {term_db.count()}')
+
+    def _update_scene_status(self, batch_id: int, total_batches: int):
+        self._scene_status_lbl.configure(text=f'Scene: {batch_id + 1}/{total_batches}')
+
+    # ── Updater ───────────────────────────────────────────────────────────────
 
     def _open_updater(self):
         if app_updater is None:
@@ -465,10 +821,9 @@ class App(tk.Tk):
                 tag = app_updater.latest_release_tag()
                 if tag and app_updater.is_newer(tag, APP_VERSION):
                     self._ui(lambda: self._upd_lbl.configure(
-                        text=f'v{APP_VERSION}  —  Update available: {tag}',
-                        foreground=ORANGE))
+                        text=f'v{APP_VERSION}  —  Update available: {tag}', foreground=ORANGE))
             except Exception:
-                pass  # offline / rate-limited — run normally
+                pass
         threading.Thread(target=work, daemon=True).start()
 
     # ── Queue / threading ─────────────────────────────────────────────────────
@@ -501,6 +856,7 @@ class App(tk.Tk):
         self._start_btn.configure(state='normal')
         self._stop_btn.configure(state='disabled')
         self._status_lbl.configure(text=msg, foreground=GREEN if ok else RED)
+        self._scene_status_lbl.configure(text='Scene: –')
 
     # ── Browse helpers ────────────────────────────────────────────────────────
 
@@ -532,31 +888,25 @@ class App(tk.Tk):
         win.title('Edit Master Template')
         win.geometry('700x500')
         win.grab_set()
-
         ttk.Label(win,
             text='Use [PlaceholderName] for dynamic fields — e.g. [Genre], [Location], [Character A Name].',
             foreground=GRAY).pack(anchor='w', padx=10, pady=(10, 4))
-
         txt = scrolledtext.ScrolledText(win, wrap='word')
         txt.pack(fill='both', expand=True, padx=10, pady=(0, 8))
         txt.insert('1.0', self._master_template)
         self._attach_context_menu(txt)
-
         def _save():
             self._master_template = txt.get('1.0', 'end').strip()
             cfg = _load_cfg()
             cfg['master_template'] = self._master_template
             _save_cfg(cfg)
             win.destroy()
-
         btn_row = ttk.Frame(win)
         btn_row.pack(fill='x', padx=10, pady=(0, 10))
         ttk.Button(btn_row, text='Cancel', command=win.destroy).pack(side='right')
         ttk.Button(btn_row, text='Save & Close', command=_save).pack(side='right', padx=(0, 6))
 
     def _open_fill_form(self):
-        # Exclude ALL-CAPS structural markers like [GLOBAL SETTING] — they are
-        # section headers in the template, not user-fillable fields.
         placeholders = list(dict.fromkeys(
             ph for ph in re.findall(r'\[([^\]]+)\]', self._master_template)
             if ph != ph.upper()
@@ -566,31 +916,20 @@ class App(tk.Tk):
                 'No [Placeholder] fields found in the Master Template.\n'
                 'Click "Edit Master Template" to add some.')
             return
-
         win = tk.Toplevel(self)
         win.title('Fill Template Form')
         win.resizable(True, True)
         win.grab_set()
-
-        # ── Toolbar ───────────────────────────────────────────────────────────
         toolbar = ttk.Frame(win, padding=(14, 10, 14, 0))
         toolbar.pack(fill='x')
         ttk.Button(toolbar, text='Paste Markdown…',
                    command=lambda: _open_paste_window()).pack(side='left')
-
-        # ── Fields ────────────────────────────────────────────────────────────
         form = ttk.Frame(win, padding=14)
         form.pack(fill='both', expand=True)
-
-        # Placeholders whose names match these strings get a multi-line text area.
         _MULTILINE = {'overview'}
-
-        entries     = {}   # ph -> StringVar   (single-line Entry widgets)
-        txt_entries = {}   # ph -> Text widget (multi-line ScrolledText widgets)
-
+        entries, txt_entries = {}, {}
         for i, ph in enumerate(placeholders):
-            ttk.Label(form, text=ph + ':').grid(
-                row=i, column=0, sticky='nw', pady=4, padx=(0, 10))
+            ttk.Label(form, text=ph + ':').grid(row=i, column=0, sticky='nw', pady=4, padx=(0, 10))
             if ph.lower() in _MULTILINE:
                 w = scrolledtext.ScrolledText(form, height=4, wrap='word', width=44)
                 w.grid(row=i, column=1, sticky='ew', pady=4)
@@ -605,52 +944,40 @@ class App(tk.Tk):
         form.columnconfigure(1, weight=1)
 
         def _set_entry(ph, val):
-            if ph in entries:
-                entries[ph].set(val)
+            if ph in entries:        entries[ph].set(val)
             elif ph in txt_entries:
                 txt_entries[ph].delete('1.0', 'end')
                 txt_entries[ph].insert('1.0', val)
 
-        # Auto-fill from whatever is currently in the World Setting text area.
         _world = self._world_txt.get('1.0', 'end').strip()
         if _world:
             for ph, val in _parse_with_template(self._master_template, _world).items():
                 _set_entry(ph, val)
 
-        # ── Paste Markdown sub-window ─────────────────────────────────────────
         def _open_paste_window():
             sub = tk.Toplevel(win)
             sub.title('Paste Markdown')
             sub.geometry('640x420')
             sub.grab_set()
-
-            ttk.Label(sub,
-                text='Paste the full Markdown block below, then click "Parse & Fill":',
+            ttk.Label(sub, text='Paste the full Markdown block below, then click "Parse & Fill":',
                 foreground=GRAY).pack(anchor='w', padx=10, pady=(10, 4))
-
             def _parse_and_fill():
                 for ph, val in _parse_with_template(
                         self._master_template, txt.get('1.0', 'end')).items():
                     _set_entry(ph, val)
                 sub.destroy()
-
             sub_btns = ttk.Frame(sub)
             sub_btns.pack(fill='x', padx=10, pady=(0, 10), side='bottom')
             ttk.Button(sub_btns, text='Cancel', command=sub.destroy).pack(side='right')
-            ttk.Button(sub_btns, text='Parse & Fill',
-                       command=_parse_and_fill).pack(side='right', padx=(0, 6))
-
+            ttk.Button(sub_btns, text='Parse & Fill', command=_parse_and_fill).pack(side='right', padx=(0, 6))
             txt = scrolledtext.ScrolledText(sub, wrap='word')
             txt.pack(fill='both', expand=True, padx=10, pady=(0, 8))
             self._attach_context_menu(txt)
 
-        # ── Apply / Cancel ────────────────────────────────────────────────────
         def _apply():
             result = self._master_template
-            for ph, var in entries.items():
-                result = result.replace(f'[{ph}]', var.get())
-            for ph, w in txt_entries.items():
-                result = result.replace(f'[{ph}]', w.get('1.0', 'end').strip())
+            for ph, var in entries.items():     result = result.replace(f'[{ph}]', var.get())
+            for ph, w in txt_entries.items():   result = result.replace(f'[{ph}]', w.get('1.0', 'end').strip())
             self._world_txt.delete('1.0', 'end')
             self._world_txt.insert('1.0', result)
             win.destroy()
@@ -662,11 +989,9 @@ class App(tk.Tk):
 
     def _import_world_setting(self):
         p = filedialog.askopenfilename(
-            title='Import world_setting.md',
-            initialfile='world_setting.md',
+            title='Import world_setting.md', initialfile='world_setting.md',
             filetypes=[('Markdown files', '*.md'), ('All files', '*.*')])
-        if not p:
-            return
+        if not p: return
         try:
             with open(p, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -685,24 +1010,42 @@ class App(tk.Tk):
             messagebox.showerror('Error', f'Source CSV not found:\n{src}')
             return
 
-        out        = os.path.splitext(src)[0] + '_th.csv'
-        world      = self._world_txt.get('1.0', 'end').strip()
-        api_url    = self._url_var.get().strip()
-        model      = self._model_var.get().strip()
-        mode       = self._mode_var.get()
-        try:
-            max_tokens = int(self._maxtok_var.get().strip())
-        except ValueError:
-            max_tokens = DEFAULT_MAX_TOKENS
-        try:
-            workers = max(1, int(self._workers_var.get().strip()))
-        except ValueError:
-            workers = DEFAULT_WORKERS
+        out     = os.path.splitext(src)[0] + '_th.csv'
+        world   = self._world_txt.get('1.0', 'end').strip()
+        api_url = self._url_var.get().strip()
+        model   = self._model_var.get().strip()
+        mode    = self._mode_var.get()
 
-        _save_cfg({'source': src, 'api_url': api_url,
-                   'model': model, 'world_setting': world, 'mode': mode,
-                   'max_tokens': max_tokens, 'workers': workers,
-                   'master_template': self._master_template})
+        try:    max_tokens = int(self._maxtok_var.get())
+        except: max_tokens = DEFAULT_MAX_TOKENS
+        try:    workers = max(1, int(self._workers_var.get()))
+        except: workers = DEFAULT_WORKERS
+        try:    batch_size = max(1, int(self._batch_size_var.get()))
+        except: batch_size = DEFAULT_BATCH_SIZE
+        try:    context_lines = max(0, int(self._ctx_lines_var.get()))
+        except: context_lines = DEFAULT_CONTEXT_LINES
+        try:    temperature = float(self._temperature_var.get())
+        except: temperature = DEFAULT_TEMPERATURE
+        try:    top_p = float(self._top_p_var.get())
+        except: top_p = DEFAULT_TOP_P
+        try:    min_p = float(self._min_p_var.get())
+        except: min_p = DEFAULT_MIN_P
+
+        scene_aware  = self._scene_aware_var.get()
+        use_char_mem = self._char_mem_var.get()
+        use_term_db  = self._term_db_var.get()
+        use_context  = self._ctx_mem_var.get()
+
+        _save_cfg({
+            'source': src, 'api_url': api_url, 'model': model,
+            'world_setting': world, 'mode': mode,
+            'max_tokens': max_tokens, 'workers': workers,
+            'master_template': self._master_template,
+            'batch_size': batch_size, 'context_lines': context_lines,
+            'scene_aware': scene_aware, 'use_char_mem': use_char_mem,
+            'use_term_db': use_term_db, 'use_context': use_context,
+            'temperature': temperature, 'top_p': top_p, 'min_p': min_p,
+        })
 
         self._busy = True
         self._stop.clear()
@@ -713,7 +1056,9 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._worker,
-            args=(src, out, world, api_url, model, mode, max_tokens, workers),
+            args=(src, out, world, api_url, model, mode, max_tokens, workers,
+                  scene_aware, use_char_mem, use_term_db, use_context,
+                  batch_size, context_lines, temperature, top_p, min_p),
             daemon=True).start()
 
     def _do_stop(self):
@@ -727,7 +1072,9 @@ class App(tk.Tk):
         def test():
             try:
                 resp = requests.post(url, json={
-                    'model': model, 'prompt': 'Hi', 'max_tokens': 1, 'stream': False,
+                    'model': model,
+                    'messages': [{'role': 'user', 'content': 'Hi'}],
+                    'max_tokens': 1, 'stream': False, 'enable_thinking': False,
                 }, timeout=5)
                 if resp.status_code == 200:
                     self._ui(lambda: self._conn_lbl.configure(text='✓ Connected', foreground=GREEN))
@@ -765,8 +1112,11 @@ class App(tk.Tk):
 
     # ── Background worker ─────────────────────────────────────────────────────
 
-    def _worker(self, src, out, world, api_url, model, mode, max_tokens, workers):
-        # Load source
+    def _worker(self, src, out, world, api_url, model, mode, max_tokens, workers,
+                scene_aware, use_char_mem, use_term_db, use_context,
+                batch_size, context_lines, temperature, top_p, min_p):
+
+        # ── Load source ───────────────────────────────────────────────────────
         try:
             df_src = pd.read_csv(src, dtype=str).fillna('')
             df_src['english'] = df_src['english'].str.strip()
@@ -775,7 +1125,7 @@ class App(tk.Tk):
             self._ui(lambda: self._finish(f'Error: {e}', False))
             return
 
-        # Build working dataframe
+        # ── Build working dataframe ───────────────────────────────────────────
         if mode == 'continue' and os.path.isfile(out):
             self._log_line('Syncing with previous work…')
             try:
@@ -784,8 +1134,7 @@ class App(tk.Tk):
                 existing = set(df_prev['english'].tolist())
                 new_rows = df_src[~df_src['english'].isin(existing)].copy()
                 if len(new_rows):
-                    if 'thai' not in new_rows.columns:
-                        new_rows['thai'] = ''
+                    if 'thai' not in new_rows.columns: new_rows['thai'] = ''
                     df = pd.concat([df_prev, new_rows], ignore_index=True)
                     self._log_line(f'  {len(new_rows)} new rows merged.')
                 else:
@@ -803,8 +1152,10 @@ class App(tk.Tk):
         if 'thai' not in df.columns:
             df['thai'] = ''
 
-        pending = df[(df['english'] != '') & (df['thai'].str.strip() == '')].index.tolist()
-        total = len(pending)
+        pending_idx  = df[(df['english'] != '') & (df['thai'].str.strip() == '')].index.tolist()
+        pending_rows = [(idx, df.at[idx, 'english']) for idx in pending_idx]
+        total        = len(pending_rows)
+
         self._log_line(f'Total rows: {len(df)}  |  Pending: {total}  |  Workers: {workers}')
         self._set_progress(0, total, f'0 / {total}')
 
@@ -814,129 +1165,83 @@ class App(tk.Tk):
             self._ui(lambda: self._finish('Nothing to translate — all done!', True))
             return
 
-        cache      = {}
-        in_flight  = {}   # text -> Event; prevents duplicate API calls for same segment
-        cache_lock = threading.Lock()
-        df_lock    = threading.Lock()
-        counters   = [0]  # [done]
-        save_every = max(1, workers * 2)
-        t_start    = time.time()
+        # ── Memory systems ────────────────────────────────────────────────────
+        char_memory = CharacterMemory()
+        if use_char_mem:
+            char_memory.seed_from_world(world)
+            names = char_memory.all_names()
+            if names:
+                self._log_line(f'Character memory seeded: {", ".join(names)}')
 
-        def translate_row(index):
+        term_db = TerminologyDB(TERMINOLOGY_FILE if use_term_db else '')
+        self._ui(lambda: self._update_memory_status(char_memory, term_db))
+
+        # ── Batch grouping ────────────────────────────────────────────────────
+        eff_batch   = batch_size if scene_aware else 1
+        eff_context = context_lines if (scene_aware and use_context) else 0
+        batches     = detect_scene_groups(pending_rows, eff_batch)
+        n_batches   = len(batches)
+        self._log_line(f'Batches: {n_batches}  |  Batch size: {eff_batch}  |  Context: {eff_context} lines')
+
+        counters = [0]
+        df_lock  = threading.Lock()
+        t_start  = time.time()
+        save_every = max(1, workers)
+
+        def process_batch(args):
+            batch_id, batch = args
             if self._stop.is_set():
                 return
+            if not hasattr(_tls, 'session'):
+                _tls.session = requests.Session()
 
-            english_text = df.at[index, 'english'].strip()
-            if not english_text or english_text == 'nan':
-                return
-
-            _tp = r'\{[^}]+\}'
-
-            # Peel off leading / trailing tag clusters
-            _lm   = re.match(r'^(?:' + _tp + r')+', english_text)
-            lead  = _lm.group(0) if _lm else ''
-            _mid  = english_text[len(lead):]
-            _tm   = re.search(r'(?:' + _tp + r')+$', _mid)
-            trail = _tm.group(0) if _tm else ''
-            body_raw = _mid[:-len(trail)] if trail else _mid
-
-            # Split body on tags — translate each text piece, keep tags verbatim
-            parts = re.split(f'({_tp})', body_raw)
-
-            def _translate_segment(seg):
-                text = seg.strip()
-                if not text:
-                    return seg
-                has_par = text.startswith('(') and text.endswith(')')
-                inner = text[1:-1].strip() if has_par else text
-
-                # Atomically check cache and register as fetcher (or waiter)
-                with cache_lock:
-                    cached = cache.get(inner)
-                    if cached is not None:
-                        return f'({cached})' if cached and has_par else cached
-                    if inner in in_flight:
-                        ev = in_flight[inner]
-                        is_fetcher = False
-                    else:
-                        ev = threading.Event()
-                        in_flight[inner] = ev
-                        is_fetcher = True
-
-                # Non-fetcher: wait for the fetcher's result
-                if not is_fetcher:
-                    ev.wait()
-                    with cache_lock:
-                        result = cache.get(inner, '')
-                    return f'({result})' if result and has_par else result or text
-
-                # Fetcher: call the API, then wake up any waiters
-                if not hasattr(_tls, 'session'):
-                    _tls.session = requests.Session()
-                prompt = _build_prompt(world, inner)
-                payload = {
-                    'model': model, 'prompt': prompt,
-                    'temperature': 0.1, 'max_tokens': max_tokens,
-                    'stop': ['\n', 'English:', 'Thai:'], 'stream': False,
-                }
-                try:
-                    for _ in range(2):
-                        if self._stop.is_set():
-                            return text
-                        try:
-                            resp = _tls.session.post(api_url, json=payload, timeout=45)
-                            if resp.status_code == 200:
-                                raw    = resp.json()['choices'][0]['text'].strip()
-                                result = clean_thai_output(raw.split('\n')[0].strip(), inner)
-                                with cache_lock:
-                                    cache[inner] = result
-                                return f'({result})' if result and has_par else result
-                            else:
-                                self._log_line(f'  Row {index+1}: server error {resp.status_code}')
-                        except Exception as e:
-                            self._log_line(f'  Row {index+1}: {e}, retrying…')
-                            time.sleep(1)
-                finally:
-                    with cache_lock:
-                        in_flight.pop(inner, None)
-                    ev.set()
-                return text  # untranslated fallback
-
-            out_parts = []
-            for part in parts:
-                if self._stop.is_set():
-                    return
-                if re.fullmatch(_tp, part):
-                    out_parts.append(part)
-                else:
-                    out_parts.append(_translate_segment(part))
-
-            thai = lead + ''.join(out_parts) + trail
+            results = _translate_batch(
+                _tls.session, api_url, model, world, df, batch,
+                char_memory, term_db, max_tokens,
+                temperature, top_p, min_p,
+                eff_context, self._stop, self._log_line, batch_id,
+            )
 
             with df_lock:
-                df.at[index, 'thai'] = thai
-                counters[0] += 1
-                d = counters[0]
-                snap = df.copy() if d % save_every == 0 else None
+                for (idx, _), th in zip(batch, results):
+                    df.at[idx, 'thai'] = th
+                counters[0] += len(batch)
+                d    = counters[0]
+                snap = df.copy() if (batch_id + 1) % save_every == 0 else None
 
             if snap is not None:
                 _safe_save(snap, out)
 
+            if use_char_mem:
+                for _, en in batch:
+                    spk = detect_speaker(en)
+                    if spk:
+                        char_memory.update(spk, seen=True)
+                self._ui(lambda: self._update_memory_status(char_memory, term_db))
+
+            self._ui(lambda bi=batch_id: self._update_scene_status(bi, n_batches))
+
             elapsed = time.time() - t_start
-            rpm_str = f'  {d/elapsed*60:.0f} r/min' if elapsed > 2 else ''
-            self._log_line(f'[{d}/{total}] {english_text[:60]} ➔ {thai}{rpm_str}')
+            rpm_str = f'  {d / elapsed * 60:.0f} lines/min' if elapsed > 2 else ''
+            first_en = batch[0][1][:55] if batch else ''
+            first_th = results[0][:55] if results else ''
+            self._log_line(f'[{d}/{total}] {first_en} ➔ {first_th}{rpm_str}')
             self._set_progress(d, total, f'{d} / {total}{rpm_str}')
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(translate_row, idx) for idx in pending]
+            futures = [executor.submit(process_batch, (i, batch))
+                       for i, batch in enumerate(batches)]
             for future in concurrent.futures.as_completed(futures):
                 if self._stop.is_set():
                     for f in futures: f.cancel()
                     self._log_line('Stopped by user.')
                     break
 
+        if use_term_db:
+            term_db.save()
+
         _safe_save(df, out)
-        d = counters[0]
+        d   = counters[0]
         msg = f'Done — {d} rows translated  →  {out}'
         self._log_line(f'\n{msg}')
         self._ui(lambda m=msg: self._finish(m, True))

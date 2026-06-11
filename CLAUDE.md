@@ -5,24 +5,34 @@
 GUI app (tkinter) that translates a CSV's `english` column → `thai` column using
 LM Studio's local API. Target: adult VN / RenPy games. Target model: Qwen3-14B-Instruct GGUF.
 
-Current version: **2.0.1** (`APP_VERSION` in `translate.py`).
+Current version: **2.1.0** (`APP_VERSION` in `translate.py`).
 
 ---
 
 ## Architecture
 
-### Pipeline (v2.0, scene-aware)
+### Pipeline (v2.1, scene-aware + token freezing)
 
 ```
 CSV rows (pending: thai == '')
   → detect_scene_groups()        # group by scene, split into batches
   → ThreadPoolExecutor           # workers submit batches in parallel
-      → _translate_batch()       # build prompt → POST → parse → validate → retry
-          → clean_thai_output()  # strip artifacts
+      → _translate_batch()       # freeze → prompt → POST → parse → clean → thaw → validate
+          → freeze_tokens()      # {tag}/[var]/%(x)s → ⟦N⟧ placeholders (pre-send)
+          → clean_thai_output()  # strip artifacts (CJK leakage, annotations)
+          → thaw_tokens()        # ⟦N⟧ → original tokens (post-clean)
           → _validate_line()     # Thai presence + token set equality
   → df_lock write thai column
   → _safe_save() every N batches
 ```
+
+### Token freezing (v2.1 core mechanism)
+
+Ren'Py markup like `{color=[KoGa3Color2]}[mc_name]{/color}` gets mangled by the
+model AND must survive cleanup. `freeze_tokens()` replaces each token with `⟦N⟧`
+before sending; `thaw_tokens()` restores them after cleaning. Speaker-label
+lines (`[Anna]`) are NOT frozen — the name must be transliteratable.
+Leftover `⟦` after thaw = model invented/dropped a placeholder → line invalid.
 
 ### Key classes
 
@@ -36,11 +46,13 @@ CSV rows (pending: thai == '')
 | Function | Notes |
 |---|---|
 | `detect_scene_groups(pending, batch_size)` | Index gap >5 OR chapter/scene/act regex = new scene boundary. Returns list of batches. |
-| `_translate_batch(...)` | 3-attempt retry loop. On `finish=length`: auto-splits batch in half, halves `context_lines` per level (10@ctx20 → 5@ctx10 → 2+3@ctx5 → 1@ctx2). Single-row fallback returns original English if all else fails. |
-| `_parse_batch_response(raw, expected)` | Strips `<think>` blocks, tries numbered-line regex first, then line-count fallback with preamble filter. Returns `None` on mismatch → triggers retry. |
+| `freeze_tokens(en)` / `thaw_tokens(th, tokens)` | Replace/restore Ren'Py tokens with `⟦N⟧` placeholders. Skipped for speaker-label lines. |
+| `_translate_batch(...)` | 3-attempt retry loop; each retry re-sends ONLY lines that haven't validated yet, with temperature nudged +0.15/attempt. On `finish=length` + parse fail: auto-splits batch in half, halves `context_lines` per level. On `finish=length` + parse OK: distrusts the last line (may be cut mid-sentence) and retries it. Lines that never validate keep original English (safe fallback — broken tags would crash Ren'Py). |
+| `_parse_batch_response(raw, expected)` | Strips `<think>` blocks, tries numbered-line regex first, then line-count fallback with preamble filter + `N.` prefix strip. Returns `None` on mismatch → triggers retry. |
 | `_validate_line(en, th)` | Thai char check + variable/tag token set equality. Skips `[...]` check for standalone speaker labels (`[Anna]` → `[แอนนา]` is valid). |
+| `_learn_speaker(term_db, en, th)` | When a speaker-label line validates, records `Anna → แอนนา` in TerminologyDB so transliteration stays consistent across batches. |
 | `_build_chat_messages(...)` | Assembles system + user messages. Strips empty `**Label:**` fields from world_setting before injection. |
-| `detect_speaker(text)` | Matches `Anna:` / `[Anna]` / `<Anna>` patterns. Used by CharacterMemory and _validate_line. |
+| `detect_speaker(text)` | Matches `Anna:` / `[Anna]` / `<Anna>` patterns. Used by CharacterMemory, freeze_tokens, _validate_line. |
 
 ---
 
@@ -89,9 +101,16 @@ Set LM Studio context to 4096+.
 ## Known issues / invariants
 
 - **Parallelism-safe context**: `df['english']` is read-only during translation; only `df['thai']` is written under `df_lock`. Context blocks read from `df['english']` without locking.
-- **`[...]` validation collision**: `[player_name]` (Ren'Py interpolation, must preserve) vs `[Anna]` (speaker label, valid to transliterate). Resolved: skip `[...]` token check when `detect_speaker(en)` returns non-None.
+- **`[...]` validation collision**: `[player_name]` (Ren'Py interpolation, must preserve) vs `[Anna]` (speaker label, valid to transliterate). Resolved: skip `[...]` token check when `detect_speaker(en)` returns non-None; freeze_tokens also skips speaker-label lines.
+- **Cleaner history (v2.1 fix)**: the old `clean_thai_output` whitelist stripped `{}[]`, emoji, and Latin letters — it destroyed correct model output (e.g. `{color=...}[mc_name]` → `32_`). v2.1 strips CJK leakage specifically instead; token freezing keeps Ren'Py markup out of the cleaner's reach entirely.
 - **Empty world setting fields**: `_build_chat_messages` strips lines matching `^\s*-?\s*\*\*[^*]+:\*\*\s*$` (e.g. `- **World Tone:** `) before injection.
-- **translate_config.json**: saved next to exe/script. Not committed (contains game-specific paths). `terminology.json` is committed as empty `{}`.
+- **translate_config.json**: saved next to exe/script. Not committed (contains game-specific paths). `terminology.json` is committed as empty `{}` — gets auto-populated with learned speaker names at runtime.
+
+## Tests
+
+`python test_v210.py` — offline suite: freeze/thaw round-trip, cleaner behavior,
+speaker learning, fake-session integration (retry-only-failed, English fallback,
+length truncation handling). No LM Studio needed.
 
 ---
 

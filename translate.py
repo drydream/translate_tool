@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 import requests
 
-APP_VERSION = '2.0.1'
+APP_VERSION = '2.1.0'
 try:
     import app_updater
 except Exception:
@@ -83,11 +83,14 @@ def _safe_save(df, path):
 
 # ─── Output cleanup ───────────────────────────────────────────────────────────
 
+# CJK leakage from the model (Chinese/Japanese/Korean) — never valid in Thai output
+_CJK_RE = re.compile(r'[぀-ヿ㐀-䶿一-鿿가-힯]+')
+
+
 def clean_thai_output(text, original_english):
     if not text:
         return ''
     text = re.split(r'//|Translation:|Note:|English:|หมายเหตุ:', text, flags=re.IGNORECASE)[0].strip()
-    variables = re.findall(r'%\([^)]+\)[a-z]|%s|%d', original_english)
     text = re.sub(r'\(เน้น[^)]*\)', '', text)
     text = re.sub(r'\(ใส่คำว่า[^)]*\)', '', text)
     text = re.sub(r'\(หรือ[^)]*\)', '', text)
@@ -95,15 +98,14 @@ def clean_thai_output(text, original_english):
     text = re.sub(r'[(][฀-๿\s"\',:!?./\-]*[)]', '', text)
     text = re.sub(r'\([^)]*[a-zA-Z\s]{3,}[^)]*\)',
                   lambda m: m.group(0) if m.group(0) in original_english else '', text)
+    text = _CJK_RE.sub('', text)
     text = re.sub(r'(.{4,}?)(?:[\s\-\:]+\1){2,}', r'\1', text)
     text = re.sub(r'\bกู\b', 'ฉัน', text)
     text = re.sub(r'\bมึง\b', 'เธอ', text)
-    if variables:
-        cleaned = re.sub("[^฀-๿\\d\\s.,!?\\-_:\'\"%()a-zA-Z]", '', text)
-    else:
-        cleaned = re.sub("[^฀-๿\\d\\s.,!?\\-_:\'\"%()]", '', text)
-    cleaned = re.sub(r'\.{4,}', '...', cleaned)
-    result = cleaned.strip('"\' ')
+    if '**' not in original_english:
+        text = text.replace('**', '')
+    text = re.sub(r'\.{4,}', '...', text)
+    result = text.strip('"\' ')
     tag_m = re.search(r'(\([^฀-๿)]+\)(?:/\([^฀-๿)]+\))*)\s*$', original_english)
     if tag_m and tag_m.group(1) not in result and not result.rstrip().endswith(')'):
         result = result.rstrip() + ' ' + tag_m.group(1)
@@ -126,6 +128,33 @@ def detect_speaker(text: str):
     if m:
         return next(g for g in m.groups() if g is not None)
     return None
+
+
+# ─── Token freezing ───────────────────────────────────────────────────────────
+# Ren'Py variables/tags ({color=[c]}, [mc_name], %(name)s …) get mangled by the
+# model AND must survive cleanup untouched. Replace them with ⟦N⟧ placeholders
+# before sending; restore after. Speaker-label lines ([Anna]) stay raw so the
+# name can be transliterated.
+
+_FREEZE_RE = re.compile(r'%\([^)]+\)[a-z]|%[sd]|\{[^{}]*\}|\[[^\[\]]*\]')
+
+
+def freeze_tokens(en: str):
+    if detect_speaker(en):
+        return en, []
+    tokens = []
+
+    def _repl(m):
+        tokens.append(m.group(0))
+        return f'⟦{len(tokens)}⟧'
+
+    return _FREEZE_RE.sub(_repl, en), tokens
+
+
+def thaw_tokens(th: str, tokens: list) -> str:
+    for i, tok in enumerate(tokens, 1):
+        th = th.replace(f'⟦{i}⟧', tok)
+    return th
 
 
 # ─── Character memory ─────────────────────────────────────────────────────────
@@ -318,8 +347,9 @@ def _build_chat_messages(world: str, context_block: str,
         sys_parts.append(term_block)
     sys_parts.append(
         'TRANSLATION RULES:\n'
-        '1. Preserve all variables exactly: %s  %d  %(name)s  {tag}  [tag]\n'
-        '2. Keep Ren\'Py/VN script tokens unchanged: {i}{/i}{b}{/b}{fast}{w}{nw}{p}{vspace=N} etc.\n'
+        '1. Codes like ⟦1⟧ ⟦2⟧ are protected placeholders — copy each one into the Thai line '
+        'at the matching position. Never translate, renumber, merge, or drop them\n'
+        '2. Preserve any other variables exactly: %s  %d  %(name)s\n'
         '3. Pronouns: ฉัน/ผม (self), เธอ/คุณ/นาย (you) — NEVER use กู/มึง\n'
         '4. Match emotional intensity exactly — raw English = raw Thai, romantic = romantic\n'
         '5. Transliterate proper names phonetically into Thai script\n'
@@ -358,6 +388,8 @@ def _parse_batch_response(raw: str, expected: int):
     lines = [l for l in lines if not re.match(
         r'^(?:Note|Translation|English|Thai|หมายเหตุ|Here|Below|Sure|Certainly|Of course|Got it|Understood)[\s:,]+',
         l, re.IGNORECASE)]
+    # Strip any leftover "N." prefixes; empty remainders stay (fail validation → retried)
+    lines = [re.sub(r'^\d+[.):\-]\s*', '', l) for l in lines]
     if len(lines) == expected:
         return lines
     return None
@@ -382,6 +414,19 @@ def _validate_line(en: str, th: str) -> bool:
 
 # ─── Core batch translator ────────────────────────────────────────────────────
 
+def _learn_speaker(term_db: TerminologyDB, en: str, th: str):
+    """Record name transliterations ([Anna] → [แอนนา]) so every batch spells them the same."""
+    name_en = detect_speaker(en)
+    if not name_en:
+        return
+    m = re.match(r'^(?:\[([^\]]+)\]|<([^>]+)>|(.+?)\s*:)\s*$', th.strip())
+    if not m:
+        return
+    name_th = next((g for g in m.groups() if g), '').strip()
+    if name_th and re.search(r'[฀-๿]', name_th):
+        term_db.add(name_en, name_th)
+
+
 def _translate_batch(session, api_url: str, model: str, world: str,
                      df, batch_rows: list,
                      char_memory: CharacterMemory, term_db: TerminologyDB,
@@ -389,43 +434,25 @@ def _translate_batch(session, api_url: str, model: str, world: str,
                      context_lines: int, stop_event, log_fn, batch_id: int) -> list:
     if not batch_rows:
         return []
-    # Auto-split: if only 1 row still fails, return original English
-    if len(batch_rows) == 1:
-        context_block = _build_context_block(df, batch_rows[0][0], context_lines)
-        messages = _build_chat_messages(world, context_block, char_memory, term_db, batch_rows)
+    frozen = [freeze_tokens(en) for _, en in batch_rows]   # [(frozen_en, tokens), …]
+    best = [None] * len(batch_rows)   # per-line: first translation that passed validation
+    context_block = _build_context_block(df, batch_rows[0][0], context_lines)
+
+    for attempt in range(3):
+        if stop_event.is_set():
+            break
+        # Only re-send lines that haven't validated yet
+        todo = [i for i, b in enumerate(best) if b is None]
+        send_rows = [(batch_rows[i][0], frozen[i][0]) for i in todo]
+        messages = _build_chat_messages(world, context_block, char_memory, term_db, send_rows)
         payload = {
             'model': model, 'messages': messages,
-            'temperature': temperature, 'top_p': top_p, 'min_p': min_p,
+            # retries at temp 0.2 are near-deterministic — nudge so output can change
+            'temperature': min(1.0, temperature + 0.15 * attempt),
+            'top_p': top_p, 'min_p': min_p,
             'max_tokens': max_tokens, 'stream': False,
             'enable_thinking': False,
         }
-        try:
-            resp = session.post(api_url, json=payload, timeout=120)
-            if resp.status_code == 200:
-                raw = resp.json()['choices'][0]['message']['content']
-                parsed = _parse_batch_response(raw, 1)
-                if parsed:
-                    return [clean_thai_output(parsed[0], batch_rows[0][1])]
-                log_fn(f'  Batch {batch_id}: single-line parse failed, raw={raw[:80]!r}')
-            else:
-                log_fn(f'  Batch {batch_id}: single-line HTTP {resp.status_code}')
-        except Exception as e:
-            log_fn(f'  Batch {batch_id}: single-line error: {e}')
-        log_fn(f'  Batch {batch_id}: keeping original for: {batch_rows[0][1][:60]!r}')
-        return [batch_rows[0][1]]
-
-    context_block = _build_context_block(df, batch_rows[0][0], context_lines)
-    messages = _build_chat_messages(world, context_block, char_memory, term_db, batch_rows)
-    payload = {
-        'model': model, 'messages': messages,
-        'temperature': temperature, 'top_p': top_p, 'min_p': min_p,
-        'max_tokens': max_tokens, 'stream': False,
-        'enable_thinking': False,
-    }
-    last_result = None
-    for attempt in range(3):
-        if stop_event.is_set():
-            return [row[1] for row in batch_rows]
         try:
             resp = session.post(api_url, json=payload, timeout=120)
             if resp.status_code != 200:
@@ -435,12 +462,12 @@ def _translate_batch(session, api_url: str, model: str, world: str,
             data = resp.json()['choices'][0]
             raw = data['message']['content']
             finish = data.get('finish_reason', '?')
-            parsed = _parse_batch_response(raw, len(batch_rows))
+            parsed = _parse_batch_response(raw, len(send_rows))
             if parsed is None:
                 got = len([l for l in raw.strip().splitlines() if l.strip()])
-                log_fn(f'  Batch {batch_id}: parse error – expected {len(batch_rows)},'
+                log_fn(f'  Batch {batch_id}: parse error – expected {len(send_rows)},'
                        f' got ~{got}, finish={finish}')
-                if finish == 'length':
+                if finish == 'length' and len(batch_rows) > 1:
                     # Output truncated — split batch in half, also halve context to shed overhead
                     mid = len(batch_rows) // 2
                     sub_ctx = max(0, context_lines // 2)
@@ -457,23 +484,33 @@ def _translate_batch(session, api_url: str, model: str, world: str,
                     return a + b
                 time.sleep(1)
                 continue
-            final, all_valid = [], True
-            for (_, en), th in zip(batch_rows, parsed):
-                th_clean = clean_thai_output(th, en)
-                if not _validate_line(en, th_clean):
-                    all_valid = False
-                final.append(th_clean)
-            last_result = final
-            if all_valid:
-                return final
+            for j, i in enumerate(todo):
+                if finish == 'length' and j == len(todo) - 1:
+                    continue   # last line may be cut mid-sentence — retry it
+                en = batch_rows[i][1]
+                th = thaw_tokens(clean_thai_output(parsed[j], frozen[i][0]), frozen[i][1])
+                if '⟦' not in th and _validate_line(en, th):
+                    best[i] = th
+                    _learn_speaker(term_db, en, th)
+                else:
+                    log_fn(f'  Batch {batch_id}: val fail – en={en[:50]!r} th={th[:50]!r}')
+            if all(b is not None for b in best):
+                return best
             log_fn(f'  Batch {batch_id}: validation issues, attempt {attempt + 1}')
             time.sleep(1)
         except Exception as e:
             log_fn(f'  Batch {batch_id}: {e}, attempt {attempt + 1}')
             time.sleep(2)
-    if last_result:
-        return last_result
-    return [row[1] for row in batch_rows]
+    # Lines that never validated: keep original English (broken tags/vars
+    # would crash Ren'Py; English is the safe fallback)
+    out = []
+    for b, row in zip(best, batch_rows):
+        if b is None:
+            log_fn(f'  Batch {batch_id}: keeping English for: {row[1][:60]!r}')
+            out.append(row[1])
+        else:
+            out.append(b)
+    return out
 
 
 # ─── World-setting template parser (unchanged) ────────────────────────────────

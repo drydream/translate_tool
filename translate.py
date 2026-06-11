@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 import requests
 
-APP_VERSION = '2.1.0'
+APP_VERSION = '2.1.1'
 try:
     import app_updater
 except Exception:
@@ -62,9 +62,14 @@ ORANGE = '#b05000'
 def _load_cfg():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
         return {}
+    # Migrate pre-2.0 endpoint: /v1/completions returns 400 on LM Studio
+    url = cfg.get('api_url', '')
+    if url.rstrip('/').endswith('/v1/completions'):
+        cfg['api_url'] = url.replace('/v1/completions', '/v1/chat/completions')
+    return cfg
 
 
 def _save_cfg(d):

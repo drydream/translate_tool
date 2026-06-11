@@ -5,7 +5,7 @@
 GUI app (tkinter) that translates a CSV's `english` column → `thai` column using
 LM Studio's local API. Target: adult VN / RenPy games. Target model: Qwen3-14B-Instruct GGUF.
 
-Current version: **2.1.0** (`APP_VERSION` in `translate.py`).
+Current version: **2.1.2** (`APP_VERSION` in `translate.py`).
 
 ---
 
@@ -58,9 +58,9 @@ Leftover `⟦` after thaw = model invented/dropped a placeholder → line invali
 
 ## API
 
-- Endpoint: `/v1/chat/completions` (NOT `/v1/completions` — that returns 400)
-- Always send `"enable_thinking": false` — prevents Qwen3 thinking tokens from consuming output budget; thinking goes to separate `reasoning_content` field
-- `max_tokens` = output-only budget (input prompt tokens don't count against it)
+- Endpoint: `/v1/chat/completions` (NOT `/v1/completions` — that returns 400; `_load_cfg` auto-migrates old configs)
+- **`"enable_thinking": false` in the payload is IGNORED by LM Studio** (verified via `usage.completion_tokens_details.reasoning_tokens`). The working method is the Qwen3 soft switch: append `/no_think` to the user message (done in `_build_chat_messages`). Without it, thinking varies per batch and can consume the entire `max_tokens` budget → `finish=length, got ~0`.
+- `max_tokens` = output-only budget (input prompt tokens don't count against it), but thinking tokens DO count against it
 
 ---
 

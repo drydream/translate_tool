@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 import requests
 
-APP_VERSION = '2.1.1'
+APP_VERSION = '2.1.2'
 try:
     import app_updater
 except Exception:
@@ -371,7 +371,9 @@ def _build_chat_messages(world: str, context_block: str,
             f'RECENT CONTEXT (reference only — do NOT re-translate):\n{context_block}'
         )
     numbered = '\n'.join(f'{i + 1}. {text}' for i, (_, text) in enumerate(batch_lines))
-    user_parts.append(f'TRANSLATE THESE {len(batch_lines)} LINE(S):\n{numbered}')
+    # /no_think: Qwen3 soft switch — LM Studio ignores the enable_thinking payload
+    # field, and thinking tokens count against max_tokens (can eat the whole budget)
+    user_parts.append(f'TRANSLATE THESE {len(batch_lines)} LINE(S):\n{numbered}\n/no_think')
     user_msg = '\n\n'.join(user_parts)
 
     return [

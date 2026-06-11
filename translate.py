@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 import requests
 
-APP_VERSION = '2.1.2'
+APP_VERSION = '2.1.3'
 try:
     import app_updater
 except Exception:
@@ -402,6 +402,17 @@ def _parse_batch_response(raw: str, expected: int):
     return None
 
 
+def _parse_partial(raw: str) -> dict:
+    """Salvage complete numbered lines from truncated output. The highest-numbered
+    line is dropped — it may be cut mid-sentence."""
+    raw = _strip_think(raw).strip()
+    matches = re.findall(r'^\s*(\d+)[.):\-]\s*(.+)', raw, re.MULTILINE)
+    numbered = {int(n): t.strip() for n, t in matches}
+    if numbered:
+        numbered.pop(max(numbered))
+    return numbered
+
+
 def _validate_line(en: str, th: str) -> bool:
     if not th:
         return False
@@ -474,21 +485,40 @@ def _translate_batch(session, api_url: str, model: str, world: str,
                 got = len([l for l in raw.strip().splitlines() if l.strip()])
                 log_fn(f'  Batch {batch_id}: parse error – expected {len(send_rows)},'
                        f' got ~{got}, finish={finish}')
-                if finish == 'length' and len(batch_rows) > 1:
-                    # Output truncated — split batch in half, also halve context to shed overhead
-                    mid = len(batch_rows) // 2
-                    sub_ctx = max(0, context_lines // 2)
-                    log_fn(f'  Batch {batch_id}: splitting {len(batch_rows)} → {mid}+{len(batch_rows)-mid}'
-                           f' (context {context_lines}→{sub_ctx})')
-                    a = _translate_batch(session, api_url, model, world, df,
-                                        batch_rows[:mid], char_memory, term_db,
-                                        max_tokens, temperature, top_p, min_p,
-                                        sub_ctx, stop_event, log_fn, batch_id)
-                    b = _translate_batch(session, api_url, model, world, df,
-                                        batch_rows[mid:], char_memory, term_db,
-                                        max_tokens, temperature, top_p, min_p,
-                                        sub_ctx, stop_event, log_fn, batch_id)
-                    return a + b
+                if finish == 'length':
+                    # Truncated output — salvage the complete lines, retry only the rest
+                    salvage = _parse_partial(raw)
+                    accepted = 0
+                    for j, i in enumerate(todo):
+                        th_raw = salvage.get(j + 1)
+                        if th_raw is None:
+                            continue
+                        en = batch_rows[i][1]
+                        th = thaw_tokens(clean_thai_output(th_raw, frozen[i][0]), frozen[i][1])
+                        if '⟦' not in th and _validate_line(en, th):
+                            best[i] = th
+                            _learn_speaker(term_db, en, th)
+                            accepted += 1
+                    if accepted:
+                        log_fn(f'  Batch {batch_id}: salvaged {accepted} line(s), retrying rest')
+                        if all(b is not None for b in best):
+                            return best
+                        continue
+                    if len(batch_rows) > 1:
+                        # Nothing salvageable — split batch in half, halve context to shed overhead
+                        mid = len(batch_rows) // 2
+                        sub_ctx = max(0, context_lines // 2)
+                        log_fn(f'  Batch {batch_id}: splitting {len(batch_rows)} → {mid}+{len(batch_rows)-mid}'
+                               f' (context {context_lines}→{sub_ctx})')
+                        a = _translate_batch(session, api_url, model, world, df,
+                                            batch_rows[:mid], char_memory, term_db,
+                                            max_tokens, temperature, top_p, min_p,
+                                            sub_ctx, stop_event, log_fn, batch_id)
+                        b = _translate_batch(session, api_url, model, world, df,
+                                            batch_rows[mid:], char_memory, term_db,
+                                            max_tokens, temperature, top_p, min_p,
+                                            sub_ctx, stop_event, log_fn, batch_id)
+                        return a + b
                 time.sleep(1)
                 continue
             for j, i in enumerate(todo):

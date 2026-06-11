@@ -96,6 +96,24 @@ out2 = _translate_batch(sess2, 'http://x', 'm', '', df2, [(0, 'Hello'), (1, 'Wor
 check('length: first line accepted', out2[0] == 'สวัสดี')
 check('length: truncated last line retried', out2[1] == 'โลกทั้งใบ')
 
+# 8. truncated batch (parse fail, finish=length): salvage complete lines, no split
+df3 = pd.DataFrame({'english': ['One', 'Two', 'Three'], 'thai': ['', '', '']})
+rows3 = [(0, 'One'), (1, 'Two'), (2, 'Three')]
+sess3 = FakeSession([
+    # only 2 of 3 lines came back, 2nd may be cut → salvage line 1, retry 2+3
+    FakeResp('1. หนึ่ง\n2. สองที่ถูกตั', finish='length'),
+    FakeResp('1. สอง\n2. สาม'),
+])
+logs3 = []
+out3 = _translate_batch(sess3, 'http://x', 'm', '', df3, rows3,
+                        CharacterMemory(), TerminologyDB(''),
+                        1500, 0.2, 0.9, 0.05, 0, threading.Event(),
+                        logs3.append, 2)
+check('salvage: complete line kept', out3[0] == 'หนึ่ง')
+check('salvage: rest retried ok', out3[1] == 'สอง' and out3[2] == 'สาม')
+check('salvage: no split happened', not any('splitting' in l for l in logs3))
+check('salvage: logged', any('salvaged 1 line' in l for l in logs3))
+
 print()
 print('ALL PASS' if ok else 'SOME FAILED')
 sys.exit(0 if ok else 1)
